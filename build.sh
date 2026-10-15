@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-readonly CUSTOM_REPO="https://github.com/Cartethyiaaa/android_kernel_common"
+readonly CUSTOM_REPO="https://github.com/usermahiro/android_kernel_common"
 readonly ANDROID_VERSION="android16"
 readonly KERNEL_VERSION="6.12"
 readonly MANIFEST_SUBLEVEL="38"
@@ -31,7 +31,7 @@ Usage: $0 --target <6.12|cass> [options]
 
 Options:
   --target <6.12|cass>     Which kernel source branch to build (required)
-  --ksu-branch <ref>       KernelSU-Next branch/commit (default: next tip)
+  --ksu-branch <ref>       KernelSU-Next branch/commit (default: default branch tip)
   --kernel-name <tag>      Override branding tag (default: Kinosaki-BORE or Kinosaki-CASS)
   -h, --help                Show this help
 EOF
@@ -301,12 +301,20 @@ _ksu_fix_selinux_hide_linkage() {
   local rel_path="${hide_file#"${KERNEL_DIR}"/}"
   log "Checking selinux_hide.c static-linkage patch state (${rel_path})"
 
+  # Already static upstream: nothing to patch
+  if grep -q '^static DEFINE_MUTEX(selinux_hide_mutex)' "$hide_file" \
+     && grep -q '^static bool ksu_selinux_hide_enabled' "$hide_file" \
+     && grep -q '^static bool ksu_selinux_hide_running' "$hide_file"; then
+    echo "selinux_hide.c already static upstream, skipping patch"
+    return 0
+  fi
+
   local dry_run_output
   if dry_run_output=$(patch -p0 --forward --dry-run "$hide_file" < "$patch_file" 2>&1); then
     log "Applying kernelsu-static.patch to ${rel_path}"
     patch -p0 --forward "$hide_file" < "$patch_file"
   elif grep -q "Reversed (or previously applied)" <<<"$dry_run_output"; then
-    echo "selinux_hide.c already has the static-linkage fix upstream — skipping patch"
+    echo "selinux_hide.c already patched, skipping"
   else
     echo "$dry_run_output" >&2
     die "kernelsu-static.patch failed to apply to ${rel_path}"
