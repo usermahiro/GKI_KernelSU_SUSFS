@@ -287,17 +287,20 @@ _ksu_stamp_version() {
   # Next's Kbuild derives KSU_VERSION = 30000 + rev-list --count HEAD from the
   # checkout's own history. setup.sh clones full history, so the number is
   # stable; unshallow defensively in case that ever changes, then read it.
-  if [[ -f .git/shallow ]]; then
-    git fetch --unshallow --tags origin 2>/dev/null || true
+  local kdir="${KERNEL_DIR}/KernelSU-Next/kernel"
+  [[ -f "${kdir}/Kbuild" ]] || die "KernelSU-Next kernel/Kbuild missing at ${kdir}"
+
+  if [[ -f "${KERNEL_DIR}/KernelSU-Next/.git/shallow" ]]; then
+    git -C "${KERNEL_DIR}/KernelSU-Next" fetch --unshallow --tags origin 2>/dev/null || true
   fi
 
   local commits_count base_version=30000
-  commits_count=$(git rev-list --count HEAD)
+  commits_count=$(git -C "$kdir" rev-list --count HEAD)
   KSU_VERSION=$((commits_count + base_version))
-  sed -i "s/^KSU_VERSION_FALLBACK := 1$/KSU_VERSION_FALLBACK := ${KSU_VERSION}/" Kbuild
+  sed -i "s/^KSU_VERSION_FALLBACK := 1$/KSU_VERSION_FALLBACK := ${KSU_VERSION}/" "${kdir}/Kbuild"
 
-  KSU_GIT_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.1)"
-  sed -i "s/^KSU_VERSION_TAG_FALLBACK := v0.0.1$/KSU_VERSION_TAG_FALLBACK := ${KSU_GIT_TAG}/" Kbuild
+  KSU_GIT_TAG="$(git -C "$kdir" describe --tags --abbrev=0 2>/dev/null || echo v0.0.1)"
+  sed -i "s/^KSU_VERSION_TAG_FALLBACK := v0.0.1$/KSU_VERSION_TAG_FALLBACK := ${KSU_GIT_TAG}/" "${kdir}/Kbuild"
 }
 
 _ksu_fix_selinux_hide_linkage() {
@@ -357,7 +360,7 @@ setup_kernelsu() {
 
   _ksu_checkout_branch
 
-  (cd KernelSU-Next/kernel && _ksu_stamp_version)
+  _ksu_stamp_version
   _ksu_soften_kbuild_guard
   _ksu_fix_selinux_hide_linkage
 
