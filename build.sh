@@ -357,7 +357,7 @@ setup_kernelsu() {
 
   _ksu_checkout_branch
 
-  (cd KernelSU-Next && _ksu_stamp_version)
+  (cd KernelSU-Next/kernel && _ksu_stamp_version)
   _ksu_soften_kbuild_guard
   _ksu_fix_selinux_hide_linkage
 
