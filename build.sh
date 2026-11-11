@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
 # Kinosaki Kernel build script
+#
+# One run produces one AnyKernel3 zip carrying two Images (normal + bypass).
+# SUSFS comes from KernelSU-Next's SUSFS guard LKM, not an in-kernel patch.
 
 set -euo pipefail
 
@@ -14,9 +17,11 @@ readonly VERSION="${ANDROID_VERSION}-${KERNEL_VERSION}"
 readonly WORKSPACE="$(pwd)"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PATCH_DIR="${SCRIPT_DIR}/patches"
+
 readonly KERNEL_DIR="${WORKSPACE}/kernel"
 readonly OUT_DIR="/home/runner/out"
 readonly AK3_DIR="${WORKSPACE}/AnyKernel3"
+readonly KERNEL_PATCHES="${WORKSPACE}/kernel_patches"
 
 readonly BOT_NAME="kinosaki-bot"
 readonly BOT_EMAIL="kinosaki-bot@users.noreply.github.com"
@@ -31,7 +36,7 @@ Usage: $0 --target <6.12|cass> [options]
 
 Options:
   --target <6.12|cass>     Which kernel source branch to build (required)
-  --ksu-branch <ref>       KernelSU-Next branch/commit (default: default branch tip)
+  --ksu-branch <ref>       KernelSU-Next branch/commit (default: dev tip)
   --kernel-name <tag>      Override branding tag (default: Kinosaki-BORE or Kinosaki-CASS)
   -h, --help                Show this help
 EOF
@@ -128,11 +133,11 @@ setup_build_environment() {
     export PATH="${WORKSPACE}/git-repo:${PATH}"
   fi
 
-  rm -rf "${WORKSPACE}/kernel_patches"
-  git clone --depth=1 https://github.com/WildKernels/kernel_patches.git "${WORKSPACE}/kernel_patches"
+  rm -rf "$KERNEL_PATCHES"
+  git clone --depth=1 https://github.com/WildKernels/kernel_patches.git "$KERNEL_PATCHES"
 
   rm -rf "$AK3_DIR"
-  git clone --depth=1 https://github.com/Cartethyiaaa/AnyKernel3.git -b gki-2.0 "$AK3_DIR"
+  git clone --depth=1 https://github.com/usermahiro/AnyKernel3.git -b gki-2.0 "$AK3_DIR"
 
   sudo apt-get update -qq
   sudo apt-get install -y -qq dwarves libelf-dev
@@ -266,19 +271,26 @@ apply_kernel_fixes() {
 
 _ksu_checkout_branch() {
   local ksu_repo="https://github.com/KernelSU-Next/KernelSU-Next.git"
-  local ksu_input="${KSU_BRANCH:-next}"
+  local ksu_input="${KSU_BRANCH:-dev}"
 
-  [[ -z "$KSU_BRANCH" || "$KSU_BRANCH" == "next" ]] && return
+  [[ "$ksu_input" == "dev" ]] && return
 
-  git -C KernelSU-Next/kernel fetch --depth=50 origin "$ksu_input"
+  git -C KernelSU-Next fetch --depth=50 origin "$ksu_input"
   if git ls-remote --heads "$ksu_repo" "$ksu_input" | grep -q .; then
-    git -C KernelSU-Next/kernel checkout "origin/${ksu_input}"
+    git -C KernelSU-Next checkout "origin/${ksu_input}"
   else
-    git -C KernelSU-Next/kernel checkout "$ksu_input"
+    git -C KernelSU-Next checkout "$ksu_input"
   fi
 }
 
 _ksu_stamp_version() {
+  # Next's Kbuild derives KSU_VERSION = 30000 + rev-list --count HEAD from the
+  # checkout's own history. setup.sh clones full history, so the number is
+  # stable; unshallow defensively in case that ever changes, then read it.
+  if [[ -f .git/shallow ]]; then
+    git fetch --unshallow --tags origin 2>/dev/null || true
+  fi
+
   local commits_count base_version=30000
   commits_count=$(git rev-list --count HEAD)
   KSU_VERSION=$((commits_count + base_version))
@@ -299,7 +311,6 @@ _ksu_fix_selinux_hide_linkage() {
   [[ -f "$hide_file" ]] || die "selinux_hide.c not found in any known location"
 
   local rel_path="${hide_file#"${KERNEL_DIR}"/}"
-  log "Checking selinux_hide.c static-linkage patch state (${rel_path})"
 
   # Already static upstream: nothing to patch
   if grep -q '^static DEFINE_MUTEX(selinux_hide_mutex)' "$hide_file" \
@@ -308,6 +319,8 @@ _ksu_fix_selinux_hide_linkage() {
     echo "selinux_hide.c already static upstream, skipping patch"
     return 0
   fi
+
+  log "Checking selinux_hide.c static-linkage patch state (${rel_path})"
 
   local dry_run_output
   if dry_run_output=$(patch -p0 --forward --dry-run "$hide_file" < "$patch_file" 2>&1); then
@@ -321,19 +334,126 @@ _ksu_fix_selinux_hide_linkage() {
   fi
 }
 
+_ksu_soften_kbuild_guard() {
+  # Older Next revisions hard-error at parse time when neither CONFIG_KPROBES
+  # nor CONFIG_KSU_SUSFS is set; during mrproper no .config exists yet. Demote
+  # to a warning. No-op on current dev, which has no such guard.
+  local d
+  for d in common/drivers/kernelsu KernelSU-Next/kernel; do
+    [[ -f "${KERNEL_DIR}/${d}/Kbuild" ]] || continue
+    if grep -q 'KernelSU requires either CONFIG_KPROBES' "${KERNEL_DIR}/${d}/Kbuild"; then
+      sed -i 's/\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/$(warning "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/' \
+        "${KERNEL_DIR}/${d}/Kbuild"
+      echo "Softened KSU config guard in ${d}/Kbuild"
+    fi
+  done
+}
+
 setup_kernelsu() {
   log "Setting up KernelSU-Next"
   cd "$KERNEL_DIR"
 
-  curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+  curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" | bash -s dev
 
   _ksu_checkout_branch
 
-  (cd KernelSU-Next/kernel && _ksu_stamp_version)
+  (cd KernelSU-Next && _ksu_stamp_version)
+  _ksu_soften_kbuild_guard
   _ksu_fix_selinux_hide_linkage
 
   apply_kconfig "CONFIG_KSU=y"
   echo "KSU version: $KSU_VERSION (tag: $KSU_GIT_TAG)"
+  echo "SUSFS: provided by Next's susfs_guard LKM (no in-kernel SUSFS patch)"
+}
+
+# Patches the anchored helper rewrites instead of applying as diffs.
+readonly PERF_ANCHORED=(
+  "clear_page_16bytes_align.patch"
+  "increase_sk_mem_packets.patch"
+)
+
+# Applied in this order; each is allowed to fail without aborting the build.
+readonly PERF_PATCHES=(
+  "file_struct_8bytes_align.patch"
+  "reduce_cache_pressure.patch"
+  "mem_opt_prefetch.patch"
+  "optimise_memcmp.patch"
+  "minimise_wakeup_time.patch"
+  "reduce_gc_thread_sleep_time.patch"
+  "add_timeout_wakelocks_globally.patch"
+  "f2fs_reduce_congestion.patch"
+  "reduce_freeze_timeout.patch"
+  "avoid_extra_s2idle_wake_attempts.patch"
+  "disable_cache_hot_buddy.patch"
+  "increase_ext4_default_commit_age.patch"
+  "reduce_pci_pme_wakeups.patch"
+  "silence_system_logspam.patch"
+)
+
+_apply_perf_patch() {
+  local name="$1" path="${KERNEL_PATCHES}/common/$1" out
+  if [[ ! -f "$path" ]]; then
+    warn "performance patch missing, skipped: $name"
+    return 0
+  fi
+  if out=$(patch -p1 -F3 --forward < "$path" 2>&1); then
+    echo "+ $name"
+  elif grep -q "Reversed (or previously applied)" <<<"$out"; then
+    echo "= $name already applied"
+  else
+    warn "performance patch did not apply, continuing: $name"
+    echo "$out" | tail -n 20
+    return 0
+  fi
+}
+
+setup_performance() {
+  log "Applying performance patches"
+  cd "${KERNEL_DIR}/common"
+
+  # Wakeup abort hook drifts between sublevels; drop it before patching so the
+  # patch's own context matches.
+  local wakeup="drivers/base/power/wakeup.c"
+  if grep -q "^void pm_system_wakeup(void)" "$wakeup"; then
+    sed -i '/^void pm_system_wakeup(void)/,/^}/{ /suspend_abort_fs_sync();/d }' "$wakeup"
+  fi
+
+  local name
+  for name in "${PERF_PATCHES[@]}"; do
+    _apply_perf_patch "$name"
+  done
+
+  python3 "${PATCH_DIR}/perf_compat.py" "${KERNEL_DIR}/common" || \
+    warn "perf_compat.py did not finish cleanly"
+}
+
+setup_bbrv3() {
+  log "Applying BBRv3"
+  cd "${KERNEL_DIR}/common"
+
+  local patch_path="${KERNEL_PATCHES}/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android16-6.12.patch"
+  [[ -f "$patch_path" ]] || die "BBRv3 patch missing at ${patch_path}"
+
+  python3 "${PATCH_DIR}/bbrv3_compat.py" "${KERNEL_DIR}/common" "$patch_path"
+
+  apply_kconfig "CONFIG_TCP_CONG_BBR3=y"
+}
+
+setup_nomount() {
+  log "Setting up NoMount"
+  cd "$KERNEL_DIR"
+
+  (
+    cd "${KERNEL_DIR}/common"
+    curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+      https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
+  )
+
+  [[ -L "${KERNEL_DIR}/common/fs/nomount" ]] \
+    || die "NoMount integration failed: fs/nomount symlink missing"
+  echo "NoMount commit: $(git -C "${KERNEL_DIR}/common/NoMount" rev-parse HEAD)"
+
+  apply_kconfig "CONFIG_NOMOUNT=y"
 }
 
 setup_bbg() {
@@ -377,14 +497,17 @@ CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
 CONFIG_NETFILTER_XT_SET=y
 CONFIG_NETFILTER_XT_TARGET_LOG=y
 CONFIG_NETFILTER_XT_MATCH_RECENT=y
+CONFIG_IP_NF_TARGET_REJECT=y
+CONFIG_IP6_NF_TARGET_REJECT=y
 CONFIG_IP6_NF_NAT=y
 CONFIG_IP6_NF_TARGET_MASQUERADE=y
 CONFIG_TCP_CONG_ADVANCED=y
 CONFIG_TCP_CONG_BBR=y
+CONFIG_TCP_CONG_BBR3=y
 # CONFIG_TCP_CONG_CUBIC is not set
 # CONFIG_TCP_CONG_BIC is not set
 CONFIG_TCP_CONG_WESTWOOD=y
-#CONFIG_TCP_CONG_HTCP is not set
+# CONFIG_TCP_CONG_HTCP is not set
 CONFIG_DEFAULT_BBR=y
 CONFIG_DEFAULT_TCP_CONG="westwood"
 CONFIG_NET_SCH_FQ=y
@@ -394,6 +517,7 @@ CONFIG_NET_ACT_CONNMARK=y
 CONFIG_IP_NF_TARGET_TTL=y
 CONFIG_IP6_NF_TARGET_HL=y
 CONFIG_IP6_NF_MATCH_HL=y
+CONFIG_MACVLAN=y
 CONFIG_WIREGUARD=y
 CONFIG_CIFS=y
 CONFIG_NETWORK_FILESYSTEMS=y
@@ -450,8 +574,8 @@ setup_ntsync() {
   rm -f include/uapi/linux/ntsync.h
   rm -f drivers/misc/ntsync.c
 
-  patch -p1 < "${WORKSPACE}/kernel_patches/common/ntsync/ntsync_compat_${VERSION}.patch"
-  patch -p1 < "${WORKSPACE}/kernel_patches/common/ntsync/ntsync_base.patch"
+  patch -p1 < "${KERNEL_PATCHES}/common/ntsync/ntsync_compat_${VERSION}.patch"
+  patch -p1 < "${KERNEL_PATCHES}/common/ntsync/ntsync_base.patch"
 
   apply_kconfig "CONFIG_NTSYNC=y"
 }
@@ -464,7 +588,7 @@ apply_ptrace_patch() {
   log "Checking ptrace patch (kernel ${KERNEL_VERSION})"
   if _kernel_version_le "5.16"; then
     cd "${KERNEL_DIR}/common"
-    patch -p1 -F3 < "${WORKSPACE}/kernel_patches/gki_ptrace.patch"
+    patch -p1 -F3 < "${KERNEL_PATCHES}/gki_ptrace.patch"
   else
     echo "Kernel >= 5.16, skipping ptrace patch"
   fi
@@ -474,9 +598,9 @@ apply_unicode_fix() {
   log "Applying unicode fix patch"
   cd "${KERNEL_DIR}/common"
   if _kernel_version_le "5.16"; then
-    patch -p1 --forward < "${WORKSPACE}/kernel_patches/common/unicode_bypass_fix_6.1-.patch"
+    patch -p1 --forward < "${KERNEL_PATCHES}/common/unicode_bypass_fix_6.1-.patch"
   else
-    patch -p1 --forward < "${WORKSPACE}/kernel_patches/common/unicode_bypass_fix_6.1+.patch"
+    patch -p1 --forward < "${KERNEL_PATCHES}/common/unicode_bypass_fix_6.1+.patch"
   fi
 }
 
@@ -494,6 +618,10 @@ CONFIG_UPROBES=y
 CONFIG_UPROBE_EVENTS=y
 CONFIG_FUSE_BPF=y
 CONFIG_DEBUG_INFO_BTF=y
+CONFIG_FANOTIFY=y
+CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y
+CONFIG_ZRAM=y
+CONFIG_ZSMALLOC=y
 EOF
 )"
 }
@@ -528,7 +656,7 @@ remove_protected_exports() {
   fi
 
   if grep -q 'protected_module_names_list' common/BUILD.bazel; then
-    perl -pi -e 's/^\s*protected_module_names_list\s*=\s*":gki_(?:aarch64|x86_64)_protected_module_names",\s*$//;' common/BUILD.bazel
+    perl -pi -e 's/^\s*protected_module_names_list\s*=\s*:[A-Za-z0-9_]*_protected_module_names,\s*$//;' common/BUILD.bazel
   fi
 }
 
@@ -624,6 +752,8 @@ build_variant() {
     cp "$image_out" "${AK3_DIR}/Bypass-Image"
     cp "${PATCH_DIR}/anykernel3-bypass.patch" "${AK3_DIR}/bypass.patch"
     (cd "$AK3_DIR" && patch -p1 < bypass.patch)
+    # The menu patch must not ship inside the zip.
+    rm -f "${AK3_DIR}/bypass.patch"
   else
     cp "$image_out" "${AK3_DIR}/Image"
   fi
@@ -638,20 +768,29 @@ build_kernel() {
 scan_patch_rejects() {
   log "Scanning for .rej files"
   local rejects_dir="${WORKSPACE}/patch-rejects"
+  rm -rf "$rejects_dir"
   mkdir -p "$rejects_dir"
 
-  local rej_count=0 rej rel
+  local rej_count=0 rej rel orig
   while IFS= read -r rej; do
     rel="${rej#"$KERNEL_DIR"/}"
     [[ "$(basename "$rel")" == "i2c-nomadik.c.rej" ]] && continue
 
     mkdir -p "$(dirname "${rejects_dir}/${rel}")"
     cp "$rej" "${rejects_dir}/${rel}"
+
+    orig="${rej%.rej}"
+    if [[ -f "$orig" ]]; then
+      mkdir -p "$(dirname "${rejects_dir}/${rel%.rej}")"
+      cp "$orig" "${rejects_dir}/${rel%.rej}"
+    fi
+
+    echo "$rel" >> "${rejects_dir}/index.txt"
     rej_count=$((rej_count + 1))
   done < <(find "$KERNEL_DIR" -type f -name '*.rej' 2>/dev/null || true)
 
   if (( rej_count > 0 )); then
-    warn "${rej_count} patch reject(s) found — see ${rejects_dir}"
+    warn "${rej_count} patch reject(s) found - see ${rejects_dir}"
   else
     echo "No patch rejects."
     rmdir "$rejects_dir" 2>/dev/null || true
@@ -661,6 +800,9 @@ scan_patch_rejects() {
 package_output() {
   log "Packaging AnyKernel3 as ${FILE_NAME}.zip"
   mkdir -p "${WORKSPACE}/out"
+
+  [[ -f "${AK3_DIR}/Image" && -f "${AK3_DIR}/Bypass-Image" ]] \
+    || die "expected both Image and Bypass-Image in ${AK3_DIR}"
 
   local zip_path="${WORKSPACE}/out/${FILE_NAME}.zip"
   rm -f "$zip_path"
@@ -673,7 +815,7 @@ main() {
   resolve_custom_branch
 
   echo "============================================================"
-  echo " Kinosaki Kernel build — target: ${TARGET} (${VERSION}, branch ${CUSTOM_BRANCH})"
+  echo " Kinosaki Kernel build - target: ${TARGET} (${VERSION}, branch ${CUSTOM_BRANCH})"
   echo "============================================================"
 
   setup_build_environment
@@ -682,6 +824,9 @@ main() {
   extract_sublevel_and_name
   setup_kernelsu
   apply_kernel_fixes
+  setup_performance
+  setup_bbrv3
+  setup_nomount
   setup_bbg
   setup_networking
   setup_droidspaces
