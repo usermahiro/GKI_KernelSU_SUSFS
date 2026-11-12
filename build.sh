@@ -2,8 +2,6 @@
 #
 # Kinosaki Kernel build script
 #
-# One run produces one AnyKernel3 zip carrying two Images (normal + bypass).
-# SUSFS comes from KernelSU-Next's SUSFS guard LKM, not an in-kernel patch.
 
 set -euo pipefail
 
@@ -284,9 +282,6 @@ _ksu_checkout_branch() {
 }
 
 _ksu_stamp_version() {
-  # Next's Kbuild derives KSU_VERSION = 30000 + rev-list --count HEAD from the
-  # checkout's own history. setup.sh clones full history, so the number is
-  # stable; unshallow defensively in case that ever changes, then read it.
   local kdir="${KERNEL_DIR}/KernelSU-Next/kernel"
   [[ -f "${kdir}/Kbuild" ]] || die "KernelSU-Next kernel/Kbuild missing at ${kdir}"
 
@@ -338,9 +333,6 @@ _ksu_fix_selinux_hide_linkage() {
 }
 
 _ksu_soften_kbuild_guard() {
-  # Older Next revisions hard-error at parse time when neither CONFIG_KPROBES
-  # nor CONFIG_KSU_SUSFS is set; during mrproper no .config exists yet. Demote
-  # to a warning. No-op on current dev, which has no such guard.
   local d
   for d in common/drivers/kernelsu KernelSU-Next/kernel; do
     [[ -f "${KERNEL_DIR}/${d}/Kbuild" ]] || continue
@@ -369,13 +361,13 @@ setup_kernelsu() {
   echo "SUSFS: provided by Next's susfs_guard LKM (no in-kernel SUSFS patch)"
 }
 
-# Patches the anchored helper rewrites instead of applying as diffs.
+# Patches the anchored helper.
 readonly PERF_ANCHORED=(
   "clear_page_16bytes_align.patch"
   "increase_sk_mem_packets.patch"
 )
 
-# Applied in this order; each is allowed to fail without aborting the build.
+# Applied patches.
 readonly PERF_PATCHES=(
   "file_struct_8bytes_align.patch"
   "reduce_cache_pressure.patch"
@@ -414,8 +406,6 @@ setup_performance() {
   log "Applying performance patches"
   cd "${KERNEL_DIR}/common"
 
-  # Wakeup abort hook drifts between sublevels; drop it before patching so the
-  # patch's own context matches.
   local wakeup="drivers/base/power/wakeup.c"
   if grep -q "^void pm_system_wakeup(void)" "$wakeup"; then
     sed -i '/^void pm_system_wakeup(void)/,/^}/{ /suspend_abort_fs_sync();/d }' "$wakeup"
@@ -500,8 +490,6 @@ CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
 CONFIG_NETFILTER_XT_SET=y
 CONFIG_NETFILTER_XT_TARGET_LOG=y
 CONFIG_NETFILTER_XT_MATCH_RECENT=y
-CONFIG_IP_NF_TARGET_REJECT=y
-CONFIG_IP6_NF_TARGET_REJECT=y
 CONFIG_IP6_NF_NAT=y
 CONFIG_IP6_NF_TARGET_MASQUERADE=y
 CONFIG_TCP_CONG_ADVANCED=y
@@ -520,7 +508,6 @@ CONFIG_NET_ACT_CONNMARK=y
 CONFIG_IP_NF_TARGET_TTL=y
 CONFIG_IP6_NF_TARGET_HL=y
 CONFIG_IP6_NF_MATCH_HL=y
-CONFIG_MACVLAN=y
 CONFIG_WIREGUARD=y
 CONFIG_CIFS=y
 CONFIG_NETWORK_FILESYSTEMS=y
@@ -659,7 +646,7 @@ remove_protected_exports() {
   fi
 
   if grep -q 'protected_module_names_list' common/BUILD.bazel; then
-    perl -pi -e 's/^\s*protected_module_names_list\s*=\s*:[A-Za-z0-9_]*_protected_module_names,\s*$//;' common/BUILD.bazel
+    perl -pi -e 's/^\s*protected_module_names_list\s*=\s*":gki_(?:aarch64|x86_64)_protected_module_names",\s*$//;' common/BUILD.bazel
   fi
 }
 
@@ -755,7 +742,6 @@ build_variant() {
     cp "$image_out" "${AK3_DIR}/Bypass-Image"
     cp "${PATCH_DIR}/anykernel3-bypass.patch" "${AK3_DIR}/bypass.patch"
     (cd "$AK3_DIR" && patch -p1 < bypass.patch)
-    # The menu patch must not ship inside the zip.
     rm -f "${AK3_DIR}/bypass.patch"
   else
     cp "$image_out" "${AK3_DIR}/Image"
